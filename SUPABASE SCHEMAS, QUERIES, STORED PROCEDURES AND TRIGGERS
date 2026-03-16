@@ -1,0 +1,359 @@
+ -- RAW CUSTOMER EVENTS SCHEMA
+
+CREATE TABLE IF NOT EXISTS raw_customer_events (
+    row_id BIGSERIAL PRIMARY KEY,
+    source TEXT,           
+    event_time TIMESTAMP DEFAULT NOW(),
+
+    customer_id TEXT,
+
+    -- Aggregated (Model A)
+    tenure_months FLOAT,
+    monthly_fee FLOAT,
+    total_revenue FLOAT,
+
+    -- Behavioral (Model B)
+    lifetime_value FLOAT,
+    total_purchases FLOAT,
+    membership FLOAT,
+    days_since_last_purchase INT,
+
+    -- Optional / shared
+    age INT,
+    city TEXT,
+
+    extra_payload JSONB
+); 
+
+
+ -- VALIDATION RESULTS SCHEMA
+
+CREATE TABLE IF NOT EXISTS validation_results (
+    validation_id BIGSERIAL PRIMARY KEY,
+    raw_row_id BIGINT NOT NULL,
+    model_type TEXT CHECK (model_type IN ('AGGREGATED MODEL', 'BEHAVIORAL MODEL')),
+    validation_status TEXT CHECK (
+        validation_status IN ('VALID', 'RECOVERABLE', 'INVALID')
+    ),
+    failure_reason TEXT,
+    validated_at TIMESTAMPTZ DEFAULT now(),
+    membership_raw NUMERIC,
+    membership_unit_inferred TEXT
+    CHECK (membership_unit_inferred IN ('flag','months','years','ambiguous','unknown')),
+    membership_years NUMERIC,
+    membership_confidence TEXT
+    CHECK (membership_confidence IN ('high','medium','low'))
+);    
+-- RUN SCHEDULED VALIDATION QUERY
+CREATE OR REPLACE FUNCTION run_scheduled_validation()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    r RECORD;
+
+     a_has_required_fields BOOLEAN;
+     a_has_valid_ranges    BOOLEAN;
+     a_has_derivable_ltv   BOOLEAN;
+
+     b_has_required_fields BOOLEAN;
+     b_has_valid_ranges    BOOLEAN;
+     b_has_derivable_ltv   BOOLEAN;
+
+    --MEMBERSHIP NORMALIZATION VARIABLES
+     membership_years NUMERIC;
+     membership_unit_inferred TEXT;
+     membership_confidence TEXT;
+BEGIN
+    FOR r IN
+        SELECT *
+        FROM raw_customer_events rc
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM validation_results vr
+            WHERE vr.raw_row_id = rc.row_id
+        )
+    LOOP
+
+    -- MODEL A (Aggregated)
+    
+    a_has_required_fields :=
+        r.tenure_months IS NOT NULL
+        AND r.monthly_fee IS NOT NULL;
+
+    a_has_derivable_ltv :=
+        r.total_revenue IS NOT NULL;
+
+    a_has_valid_ranges :=
+        r.tenure_months BETWEEN 1 AND 120
+        AND r.monthly_fee > 0
+        AND (r.total_revenue IS NULL OR r.total_revenue > 0);
+
+    IF a_has_required_fields
+       AND a_has_derivable_ltv
+       AND a_has_valid_ranges
+    THEN
+        INSERT INTO validation_results
+        (raw_row_id, model_type, validation_status, validation_reason_code)
+        VALUES (r.row_id, 'AGGREGATED MODEL', 'VALID','OK');
+
+    ELSIF a_has_required_fields
+          AND a_has_valid_ranges
+    THEN
+        INSERT INTO validation_results
+        (raw_row_id, model_type, validation_status, failure_reason, validation_reason_code)
+        VALUES (
+            r.row_id,
+            'AGGREGATED MODEL',
+            'RECOVERABLE',
+            'Total revenue missing but can be derived',
+            'MISSING LTV BUT REVENUE EXIST'
+        );
+
+    ELSIF NOT a_has_valid_ranges
+    THEN
+    INSERT INTO validation_results
+    (raw_row_id, model_type, validation_status,failure_reason,validation_reason_code)
+    VALUES (
+        r.row_id,
+        'AGGREGATED MODEL',
+        'INVALID',
+        'One or more aggregated values out of range',
+        'RANGE_VIOLATION'
+    );
+
+    ELSE
+        INSERT INTO validation_results
+        (raw_row_id, model_type, validation_status, failure_reason, validation_reason_code)
+        VALUES (
+            r.row_id,
+            'AGGREGATED MODEL',
+            'INVALID',
+            'Missing critical features',
+            'MISSING CRITICAL'
+        );
+    END IF;
+    
+    -- MEMBERSHIP NORMALIZATION (BEHAVIORAL)
+
+    IF r.membership IS NULL THEN
+        membership_unit_inferred := 'unknown';
+        membership_years := NULL;
+        membership_confidence := 'low';
+
+    ELSIF r.membership IN (0,1) THEN
+        membership_unit_inferred := 'ambiguous';
+        membership_years := 1;      -- safe default
+        membership_confidence := 'low';
+
+    ELSIF r.membership > 1 AND r.membership <= 24 THEN
+        membership_unit_inferred := 'months';
+        membership_years := r.membership / 12.0;
+        membership_confidence := 'medium';
+
+    ELSIF r.membership > 24 AND r.membership <= 120 THEN
+        membership_unit_inferred := 'years';
+        membership_years := r.membership;
+        membership_confidence := 'high';
+
+    ELSE
+        membership_unit_inferred := 'unknown';
+        membership_years := NULL;
+        membership_confidence := 'low';
+    END IF;
+
+    -- MODEL B (Behavioral)
+
+    b_has_required_fields :=
+        r.total_purchases IS NOT NULL
+        AND membership_years IS NOT NULL 
+        AND r.days_since_last_purchase IS NOT NULL;
+
+    b_has_derivable_ltv :=
+        r.lifetime_value IS NOT NULL
+        OR r.total_revenue IS NOT NULL;   
+
+    b_has_valid_ranges :=
+    ( r.lifetime_value IS NULL OR r.lifetime_value > 0 )
+    AND ( r.total_revenue IS NULL OR r.total_revenue > 0 )
+    AND membership_years >= 0;
+
+    IF b_has_required_fields
+       AND b_has_derivable_ltv
+       AND b_has_valid_ranges
+
+    THEN 
+       INSERT INTO validation_results
+       (raw_row_id, model_type, validation_status, membership_raw, membership_unit_inferred, membership_years, membership_confidence, validation_reason_code)
+       VALUES(r.row_id, 'BEHAVIORAL MODEL', 'VALID', r.membership, membership_unit_inferred , membership_years, membership_confidence, 'OK');
+
+
+    ELSIF b_has_required_fields AND b_has_valid_ranges
+
+    THEN 
+       INSERT INTO validation_results
+       (raw_row_id, model_type, validation_status, failure_reason, membership_raw, membership_unit_inferred, membership_years, membership_confidence, validation_reason_code)     
+       VALUES(r.row_id, 'BEHAVIORAL MODEL', 'RECOVERABLE', 'Missing lifetime value but can be derived', r.membership, membership_unit_inferred, membership_years, membership_confidence, 'MISSING LTV') ;
+
+
+    ELSIF NOT b_has_valid_ranges
+
+    THEN
+    INSERT INTO validation_results
+    (raw_row_id, model_type, validation_status,failure_reason, membership_raw, membership_unit_inferred, membership_years, membership_confidence,validation_reason_code)
+    VALUES (
+        r.row_id,
+        'BEHAVIORAL MODEL', 'INVALID', 'One or more behavioral values out of range', r.membership, membership_unit_inferred, membership_years, membership_confidence,'RANGE_VIOLATION');
+
+    ELSE
+        INSERT INTO validation_results
+        (raw_row_id, model_type, validation_status, failure_reason, membership_raw, membership_unit_inferred, membership_years, membership_confidence, validation_reason_code)
+        VALUES (
+            r.row_id,
+            'BEHAVIORAL MODEL', 'INVALID','Missing critical features', r.membership, membership_unit_inferred, membership_years, membership_confidence,'MISSING CRITICAL'); 
+
+    END IF;          
+    END LOOP;
+END;
+$$;
+
+
+--CRON SCHEDULE QUERY
+
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+SELECT cron.schedule(
+  'scheduled_validation_job',
+  '*/5 * * * *',
+  $$SELECT run_scheduled_validation();$$
+);
+
+
+--validation views
+
+CREATE OR REPLACE VIEW curated_customer_aggregated_model AS
+SELECT rc.*
+FROM raw_customer_events rc
+JOIN validation_results vr
+  ON rc.row_id = vr.raw_row_id
+WHERE vr.model_type = 'AGGREGATED MODEL'
+  AND vr.validation_status IN ('VALID', 'RECOVERABLE');
+
+
+CREATE OR REPLACE VIEW curated_customer_behavioral_model AS
+SELECT rc.* 
+FROM raw_customer_events rc 
+JOIN validation_results vr
+  ON rc.row_id = vr.raw_row_id 
+WHERE vr.model_type = 'BEHAVIORAL MODEL'
+  AND vr.validation_status IN ('VALID', 'RECOVERABLE');
+--cleaning layer
+
+
+CREATE OR REPLACE VIEW clean_customer_model_a AS
+SELECT
+    row_id,
+    CAST(tenure_months AS INTEGER) AS tenure_months,
+    CAST(monthly_fee AS NUMERIC) AS monthly_fee,
+    CAST(total_revenue AS NUMERIC) AS total_revenue
+FROM curated_customer_aggregated_model
+WHERE tenure_months BETWEEN 1 AND 120
+  AND monthly_fee > 0
+  AND total_revenue >= 0;
+
+-- Cleaning layer: Behavioral model
+
+CREATE OR REPLACE VIEW clean_customer_model_b AS
+SELECT
+    c.row_id,
+
+    CAST(c.total_purchases AS INTEGER) AS total_purchases,
+
+    -- Normalized exposure from validation table
+    CAST(COALESCE(vr.membership_years, 0) AS NUMERIC) AS membership_years,
+
+    CAST(c.days_since_last_purchase AS INTEGER) AS days_since_last_purchase,
+
+    CAST(c.lifetime_value AS NUMERIC) AS lifetime_value
+
+FROM curated_customer_behavioral_model c
+LEFT JOIN validation_results vr
+    ON c.row_id = vr.raw_row_id
+    AND vr.model_type = 'BEHAVIORAL MODEL'
+    AND vr.validation_status IN ('VALID', 'RECOVERABLE')
+
+WHERE c.total_purchases >= 0
+  AND COALESCE(vr.membership_years, 0) >= 0
+  AND c.days_since_last_purchase >= 0
+  AND c.lifetime_value >= 0;
+
+
+CREATE TABLE IF NOT EXISTS clustered_results_agg (
+    row_id BIGINT PRIMARY KEY,
+    cluster INTEGER,
+    scored_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS clustered_results_beh (
+    row_id BIGINT PRIMARY KEY,
+    cluster INTEGER,
+    scored_at TIMESTAMP DEFAULT NOW()
+);  
+
+CREATE OR REPLACE VIEW final_customer_clusters AS
+SELECT
+    row_id,
+    cluster,
+    'behavioral' AS model_used,
+    scored_at
+FROM clustered_results_beh
+WHERE scored_at IS NOT NULL
+-- Only pick behavioral table if it's more recent than agg
+AND scored_at >= (SELECT MAX(scored_at) FROM clustered_results_agg)
+
+UNION ALL
+
+SELECT
+    row_id,
+    cluster,
+    'aggregated' AS model_used,
+    scored_at
+FROM clustered_results_agg
+WHERE scored_at IS NOT NULL
+AND scored_at > (SELECT MAX(scored_at) FROM clustered_results_beh);
+
+CREATE TABLE IF NOT EXISTS model_runs (
+
+run_id SERIAL PRIMARY KEY,
+
+model_name TEXT,
+model_version TEXT,
+
+dataset_size INTEGER,
+n_clusters INTEGER,
+
+silhouette_score NUMERIC,
+
+run_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+);
+
+create extension if not exists pg_net;
+
+CREATE TABLE IF NOT EXISTS system_secrets (
+    key text PRIMARY KEY,
+    value text NOT NULL
+);
+INSERT INTO system_secrets (key, value)
+VALUES ('API_SECRET', ' ');
+
+
+
+CREATE TRIGGER run_clustering_trigger
+AFTER INSERT ON clean_customer_model_a
+FOR EACH STATEMENT
+EXECUTE FUNCTION trigger_clustering_api();
+
+CREATE TRIGGER run_clustering_trigger_b
+AFTER INSERT ON clean_customer_model_b
+FOR EACH STATEMENT
+EXECUTE FUNCTION trigger_clustering_api();
